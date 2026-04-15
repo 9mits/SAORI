@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mysterious-bot-x",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["mysterious-bot-x-main/mbx_main.py"],
+      "port": 0
+    }
+  ]
+}
