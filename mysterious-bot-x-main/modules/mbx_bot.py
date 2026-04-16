@@ -43,6 +43,7 @@ EXTENSIONS = (
     "cogs.modmail",
     "cogs.automod",
     "cogs.system",
+    "cogs.branding",
 )
 
 BASE_DIR_NAME = "database"
