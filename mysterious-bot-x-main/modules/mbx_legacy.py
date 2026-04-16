@@ -994,11 +994,23 @@ def extract_snowflake_id(raw_value: str) -> Optional[int]:
 
 
 def get_primary_guild() -> Optional[discord.Guild]:
-    if not getattr(bot, "data_manager", None):
-        return bot.guilds[0] if bot.guilds else None
-    guild_id = bot.data_manager.config.get("guild_id", DEFAULT_GUILD_ID)
-    if guild_id:
-        guild = bot.get_guild(int(guild_id))
+    """
+    Return the guild for the current async context.
+
+    Multi-server: reads the guild_id from the active GuildStore (set by the
+    cog's event handler via set_guild_store).  Falls back to the first guild
+    the bot is in only when no context is available (e.g. during startup).
+    """
+    from storage import get_guild_store
+    store = get_guild_store()
+    if store is not None:
+        guild = bot.get_guild(store.guild_id)
+        if guild:
+            return guild
+    # Legacy fallback: config guild_id or first connected guild
+    if getattr(bot, "guild_manager", None) and bot.guild_manager._stores:
+        first_store = next(iter(bot.guild_manager._stores.values()))
+        guild = bot.get_guild(first_store.guild_id)
         if guild:
             return guild
     return bot.guilds[0] if bot.guilds else None
@@ -3231,7 +3243,7 @@ async def execute_punishment(interaction, target, moderator, reason, minutes, no
             return
 
     # Anti-Abuse: Rate Limit
-    if abuse_system.check_rate_limit(moderator.id):
+    if abuse_system.check_rate_limit(moderator.id, bot.data_manager.config):
         await handle_abuse(interaction, moderator)
         return
 
@@ -6582,6 +6594,10 @@ class ModmailControlView(discord.ui.View):
         ticket["last_staff_message_at"] = now_iso()
         await bot.data_manager.save_modmail()
 
+        # Remove DM routing so the user gets the fresh-ticket prompt next time
+        if getattr(bot, "guild_manager", None):
+            bot.guild_manager.unregister_dm_ticket(self.user_id)
+
         thread = await resolve_modmail_thread(interaction.guild, ticket)
 
         transcript_file = None
@@ -6857,6 +6873,10 @@ class ModmailModal(discord.ui.Modal):
             ticket_payload["log_id"] = log_msg.id
             bot.data_manager.modmail[str(interaction.user.id)] = ticket_payload
             await bot.data_manager.save_modmail()
+
+            # Register user→guild routing so future DMs reach this guild
+            if getattr(bot, "guild_manager", None) and guild:
+                bot.guild_manager.register_dm_ticket(str(interaction.user.id), guild.id)
             
             # Initial Thread Msg
             await send_modmail_thread_intro(thread, interaction.user, self.category, fields_data)
@@ -10553,77 +10573,86 @@ async def run_native_automod_bridge(
 async def handle_native_automod_execution(execution: discord.AutoModAction, *, source: str) -> None:
     if not getattr(bot, "data_manager", None):
         return
-    if not get_feature_flag(bot.data_manager.config, "native_automod_bridge", True):
-        return
 
-    settings = get_native_automod_settings(bot.data_manager.config)
-    if not settings.get("enabled", True):
-        return
+    # Ensure guild context is set (needed when called from raw gateway fallback
+    # which doesn't have a guild context set by the cog listener).
+    from storage import get_guild_store as _get_gs, set_guild_store as _set_gs, reset_guild_store as _reset_gs
+    _ctx_token = None
+    if execution.guild_id and getattr(bot, "guild_manager", None) and _get_gs() is None:
+        _ctx_token = _set_gs(bot.guild_manager.get_store(execution.guild_id))
 
-    tracked_actions = {
-        discord.AutoModRuleActionType.block_message,
-        discord.AutoModRuleActionType.send_alert_message,
-        discord.AutoModRuleActionType.timeout,
-        discord.AutoModRuleActionType.block_member_interactions,
-    }
-    if execution.action.type not in tracked_actions:
-        return
-    if not claim_native_automod_execution(execution):
-        return
-
-    guild = bot.get_guild(execution.guild_id) or execution.guild
-    if guild is None:
-        return
-
-    member = execution.member or await resolve_member(guild, execution.user_id)
-    if member is None or member.bot:
-        logger.warning(
-            "Skipped native AutoMod bridge event without a resolvable member: guild=%s user=%s rule=%s source=%s",
-            execution.guild_id,
-            execution.user_id,
-            execution.rule_id,
-            source,
-        )
-        return
-
-    rule = None
     try:
-        rule = await execution.fetch_rule()
-    except discord.Forbidden:
-        logger.warning(
-            "Native AutoMod bridge could not fetch rule %s in guild %s. Grant Manage Guild to allow detailed rule lookups.",
-            execution.rule_id,
-            execution.guild_id,
+        if not get_feature_flag(bot.data_manager.config, "native_automod_bridge", True):
+            return
+
+        settings = get_native_automod_settings(bot.data_manager.config)
+        if not settings.get("enabled", True):
+            return
+
+        tracked_actions = {
+            discord.AutoModRuleActionType.block_message,
+            discord.AutoModRuleActionType.send_alert_message,
+            discord.AutoModRuleActionType.timeout,
+            discord.AutoModRuleActionType.block_member_interactions,
+        }
+        if execution.action.type not in tracked_actions:
+            return
+        if not claim_native_automod_execution(execution):
+            return
+
+        guild = bot.get_guild(execution.guild_id) or execution.guild
+        if guild is None:
+            return
+
+        member = execution.member or await resolve_member(guild, execution.user_id)
+        if member is None or member.bot:
+            logger.warning(
+                "Skipped native AutoMod bridge event without a resolvable member: guild=%s user=%s rule=%s source=%s",
+                execution.guild_id, execution.user_id, execution.rule_id, source,
+            )
+            return
+
+        rule = None
+        try:
+            rule = await execution.fetch_rule()
+        except discord.Forbidden:
+            logger.warning(
+                "Native AutoMod bridge could not fetch rule %s in guild %s. "
+                "Grant Manage Guild to allow detailed rule lookups.",
+                execution.rule_id, execution.guild_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to fetch native AutoMod rule %s: %s", execution.rule_id, exc)
+
+        rule_name = rule.name if rule else f"Rule {execution.rule_id}"
+        action_label = get_native_automod_action_label(execution)
+        treated_as_blocked = native_automod_rule_has_enforcement(rule, execution)
+        content = execution.content or execution.matched_content or "[Unavailable due to content intent settings]"
+        matched_keyword = execution.matched_keyword or execution.matched_content or None
+        native_alert_channel_id = None
+        if rule is not None:
+            for action in getattr(rule, "actions", []):
+                if getattr(action, "type", None) == discord.AutoModRuleActionType.send_alert_message and getattr(action, "channel_id", None):
+                    native_alert_channel_id = int(action.channel_id)
+                    break
+
+        await run_native_automod_bridge(
+            guild=guild,
+            member=member,
+            channel_id=execution.channel_id,
+            rule_id=int(execution.rule_id),
+            rule_name=rule_name,
+            content=content,
+            matched_keyword=matched_keyword,
+            action_label=action_label,
+            treated_as_blocked=treated_as_blocked,
+            preferred_log_channel_id=native_alert_channel_id,
+            native_log_url=None,
+            source=source,
         )
-    except Exception as exc:
-        logger.warning("Failed to fetch native AutoMod rule %s: %s", execution.rule_id, exc)
-
-    rule_name = rule.name if rule else f"Rule {execution.rule_id}"
-    action_label = get_native_automod_action_label(execution)
-    treated_as_blocked = native_automod_rule_has_enforcement(rule, execution)
-    content = execution.content or execution.matched_content or "[Unavailable due to content intent settings]"
-    matched_keyword = execution.matched_keyword or execution.matched_content or None
-    native_alert_channel_id = None
-    if rule is not None:
-        for action in getattr(rule, "actions", []):
-            if getattr(action, "type", None) == discord.AutoModRuleActionType.send_alert_message and getattr(action, "channel_id", None):
-                native_alert_channel_id = int(action.channel_id)
-                break
-
-    await run_native_automod_bridge(
-        guild=guild,
-        member=member,
-        channel_id=execution.channel_id,
-        rule_id=int(execution.rule_id),
-        rule_name=rule_name,
-        content=content,
-        matched_keyword=matched_keyword,
-        action_label=action_label,
-        treated_as_blocked=treated_as_blocked,
-        preferred_log_channel_id=native_alert_channel_id,
-        native_log_url=None,
-        source=source,
-    )
+    finally:
+        if _ctx_token is not None:
+            _reset_gs(_ctx_token)
 
 
 async def handle_native_automod_alert_message(message: discord.Message) -> None:
@@ -10789,7 +10818,20 @@ async def on_message(message: discord.Message):
     # Modmail Logic
     # 1. User -> Bot (DM)
     if isinstance(message.channel, discord.DMChannel):
+        # Multi-server: the SystemCog sets guild context via dm_routing if the
+        # user has an open ticket.  get_primary_guild() reads that context store.
+        # If no routing entry exists, fall back to any mutual guild.
         guild = get_primary_guild()
+        if guild is None:
+            # No routing entry yet — find a mutual guild to show the panel from
+            for g in bot.guilds:
+                try:
+                    if g.get_member(message.author.id) is not None:
+                        guild = g
+                        break
+                except Exception:
+                    pass
+
         ticket = bot.data_manager.modmail.get(str(message.author.id))
         if ticket and ticket.get("status") == "open":
             thread = await resolve_modmail_thread(guild, ticket)

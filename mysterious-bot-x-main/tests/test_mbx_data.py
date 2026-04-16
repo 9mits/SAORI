@@ -9,18 +9,18 @@ from unittest.mock import patch
 import discord
 
 from modules import mbx_data
-from modules.mbx_data import DataManager
-
-
-class DummyBot:
-    def __init__(self):
-        self.guilds = []
+from storage.guild_store import GuildStore
 
 
 class MbxDataTests(unittest.TestCase):
     def setUp(self):
-        self.manager = DataManager(DummyBot())
+        # GuildStore now requires (guild_id, base_dir); use a temp dir
+        self._tmp = tempfile.TemporaryDirectory()
+        self.manager = GuildStore(0, Path(self._tmp.name))
         self.manager.config = {"case_counter": 0}
+
+    def tearDown(self):
+        self._tmp.cleanup()
 
     def test_allocate_case_id_increments_counter(self):
         self.assertEqual(self.manager.allocate_case_id(), 1)
@@ -44,8 +44,10 @@ class MbxDataTests(unittest.TestCase):
     def test_load_all_initializes_defaults_and_migrations(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
-            db_dir = base / "database"
-            db_dir.mkdir()
+            guild_id = 123456789
+            # New per-guild layout
+            guild_dir = base / "guilds" / str(guild_id)
+            guild_dir.mkdir(parents=True)
             for name, payload in {
                 "config.json": "{}",
                 "roles.json": "{}",
@@ -56,20 +58,13 @@ class MbxDataTests(unittest.TestCase):
                 "modmail.json": "{}",
                 "lockdown.json": "{}",
             }.items():
-                (db_dir / name).write_text(payload, encoding="utf-8")
+                (guild_dir / name).write_text(payload, encoding="utf-8")
 
-            with patch.object(mbx_data, "CONFIG_FILE", db_dir / "config.json"), \
-                patch.object(mbx_data, "ROLES_FILE", db_dir / "roles.json"), \
-                patch.object(mbx_data, "PUNISHMENTS_FILE", db_dir / "punishments.json"), \
-                patch.object(mbx_data, "MOD_STATS_FILE", db_dir / "mod_stats.json"), \
-                patch.object(mbx_data, "MESSAGE_CACHE_FILE", db_dir / "message_cache.json"), \
-                patch.object(mbx_data, "PINGS_FILE", db_dir / "pings.json"), \
-                patch.object(mbx_data, "MODMAIL_FILE", db_dir / "modmail.json"), \
-                patch.object(mbx_data, "LOCKDOWN_FILE", db_dir / "lockdown.json"):
-                asyncio.run(self.manager.load_all())
-
-        self.assertIn("feature_flags", self.manager.config)
-        self.assertIsInstance(self.manager.message_cache, deque)
+            store = GuildStore(guild_id, base)
+            asyncio.run(store.load_all())
+            self.assertIn("feature_flags", store.config)
+            self.assertIsInstance(store.message_cache, deque)
+            self.assertEqual(store.config.get("guild_id"), guild_id)
 
     def test_resolve_bot_token_prefers_environment_variable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
