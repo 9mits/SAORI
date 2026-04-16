@@ -857,6 +857,17 @@ async def resolve_member(guild: discord.Guild, user_id: int) -> Optional[discord
         return None
 
 
+def _get_guild_branding() -> tuple[str, str, int]:
+    """Return (brand_name, brand_icon_url, brand_color) from the active guild store."""
+    from storage import get_guild_store
+    store = get_guild_store()
+    cfg = store.config if store else {}
+    name = cfg.get("brand_name") or BRAND_NAME
+    icon = cfg.get("brand_icon_url") or ""
+    color = int(cfg.get("brand_color") or 0)
+    return name, icon, color
+
+
 def make_embed(
     title: str,
     description: Optional[str] = None,
@@ -868,17 +879,13 @@ def make_embed(
     author_name: Optional[str] = None,
     author_icon: Optional[str] = None,
 ) -> discord.Embed:
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=EMBED_PALETTE.get(kind, EMBED_PALETTE["neutral"]),
-    )
+    brand_name, brand_icon, brand_color = _get_guild_branding()
+    color = discord.Color(brand_color) if brand_color else EMBED_PALETTE.get(kind, EMBED_PALETTE["neutral"])
+    embed = discord.Embed(title=title, description=description, color=color)
     embed.timestamp = discord.utils.utcnow()
-    footer_text = f"{BRAND_NAME} • {scope}"
-    if guild and guild.icon:
-        embed.set_footer(text=footer_text, icon_url=guild.icon.url)
-    else:
-        embed.set_footer(text=footer_text)
+    footer_text = f"{brand_name} • {scope}"
+    icon_url = brand_icon or (guild.icon.url if guild and guild.icon else None)
+    embed.set_footer(text=footer_text, icon_url=icon_url or discord.utils.MISSING)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
     if author_name:
@@ -892,12 +899,11 @@ def brand_embed(
     guild: Optional[discord.Guild] = None,
     scope: str = SCOPE_SYSTEM,
 ) -> discord.Embed:
+    brand_name, brand_icon, _ = _get_guild_branding()
     embed.timestamp = discord.utils.utcnow()
-    footer_text = f"{BRAND_NAME} • {scope}"
-    if guild and guild.icon:
-        embed.set_footer(text=footer_text, icon_url=guild.icon.url)
-    else:
-        embed.set_footer(text=footer_text)
+    footer_text = f"{brand_name} • {scope}"
+    icon_url = brand_icon or (guild.icon.url if guild and guild.icon else None)
+    embed.set_footer(text=footer_text, icon_url=icon_url or discord.utils.MISSING)
     return embed
 
 
@@ -1036,13 +1042,16 @@ async def send_modmail_panel_message(
         if note_value:
             embed.add_field(name="Quick Note", value=note_value, inline=False)
 
-    img_data, _ = await fetch_image_bytes(MODMAIL_PANEL_BANNER_URL)
+    from storage import get_guild_store as _get_gs_branding
+    _gs = _get_gs_branding()
+    _banner_url = (_gs.config.get("brand_banner_url") if _gs else "") or MODMAIL_PANEL_BANNER_URL
+    img_data, _ = await fetch_image_bytes(_banner_url)
     if img_data:
         embed.set_image(url="attachment://banner.png")
         file = discord.File(io.BytesIO(img_data), filename="banner.png")
         return await destination.send(embed=embed, file=file, view=ModmailPanelView())
 
-    embed.set_image(url=MODMAIL_PANEL_BANNER_URL)
+    embed.set_image(url=_banner_url)
     return await destination.send(embed=embed, view=ModmailPanelView())
 
 

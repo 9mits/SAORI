@@ -388,6 +388,10 @@ class GuildStore:
             "role_anchor": DEFAULT_ANCHOR_ROLE_ID,
             "category_archive": DEFAULT_ARCHIVE_CAT_ID,
             "role_mention_spam_target": DEFAULT_SPAM_ROLE_ID,
+            "brand_name": "",
+            "brand_icon_url": "",
+            "brand_banner_url": "",
+            "brand_color": 0,
         }
         for key, val in defaults.items():
             if key not in self.config:
